@@ -175,25 +175,38 @@ public class TrinoLogsResource
             catch (NumberFormatException _) {
                 throw new WebApplicationException("Invalid nextToken", BAD_REQUEST);
             }
-        }).orElseGet(() -> new StartIndex(TokenType.FORWARDS, 0));
+        }).orElseGet(() -> startFromHead ? new StartIndex(TokenType.FORWARDS, 0) : new StartIndex(TokenType.BACKWARDS, Math.max(filteredEntries.size() - 1, 0)));
 
+        // Track the number of items we need to skip depending on the token we received
+        // and the order of iteration
+        int positionInFilteredStream;
+        if (startFromHead) {
+            positionInFilteredStream = startIndex.index;
+        }
+        else {
+            // The AWS spec mandates startFromHead must be true if using a forward token
+            if (startIndex.tokenType == TokenType.FORWARDS) {
+                throw new WebApplicationException("Invalid startIndex", BAD_REQUEST);
+            }
+            // If traversing backwards, the index in the reversed stream needs to be computed based on its size
+            positionInFilteredStream = Math.max(filteredEntries.size() - startIndex.index - 1, 0);
+        }
         List<Event> events = filteredEntries.stream()
-                .skip(startIndex.index)
+                .skip(positionInFilteredStream)
                 .limit(limit)
                 .map(entry -> new Event("trino", entry.entryId(), entry.timestamp().toEpochMilli(), entry.timestamp().toEpochMilli(), format(entry)))
                 .collect(toImmutableList());
 
         Optional<String> nextBackwardToken;
         Optional<String> nextForwardToken;
-        if (startIndex.tokenType == TokenType.FORWARDS) {
-            nextBackwardToken = TokenType.BACKWARDS.atIndex(startIndex.index);
+        if (startFromHead) {
             nextForwardToken = ((startIndex.index + limit) < filteredEntries.size()) ? TokenType.FORWARDS.atIndex(startIndex.index + limit) : TokenType.FORWARDS.atIndex(startIndex.index);
+            nextBackwardToken = (startIndex.index - 1 >= 0) ? TokenType.BACKWARDS.atIndex(startIndex.index - 1) : TokenType.BACKWARDS.atIndex(startIndex.index);
         }
         else {
             nextBackwardToken = ((startIndex.index - limit) >= 0) ? TokenType.BACKWARDS.atIndex(startIndex.index - limit) : TokenType.BACKWARDS.atIndex(startIndex.index);
-            nextForwardToken = TokenType.FORWARDS.atIndex(startIndex.index);
+            nextForwardToken = (startIndex.index + 1) < filteredEntries.size() ? TokenType.FORWARDS.atIndex(startIndex.index + 1) : TokenType.FORWARDS.atIndex(startIndex.index);
         }
-
         GetLogEventsResponse response = new GetLogEventsResponse(events, nextBackwardToken, nextForwardToken);
 
         return Response.ok(response).build();

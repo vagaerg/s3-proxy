@@ -43,10 +43,10 @@ import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
 import software.amazon.awssdk.services.cloudwatchlogs.model.GetLogEventsRequest;
 import software.amazon.awssdk.services.cloudwatchlogs.model.GetLogEventsResponse;
 import software.amazon.awssdk.services.cloudwatchlogs.model.OutputLogEvent;
-import software.amazon.awssdk.services.cloudwatchlogs.paginators.GetLogEventsIterable;
 
 import java.net.URI;
 import java.time.Instant;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -108,26 +108,116 @@ public class TestLogsResource
     @Test
     public void testOrdering()
     {
-        final int qty = 500;
+        // We expect to see 2 entries per log, one for request processing start and one for request processing end
+        final int logQty = 500;
 
-        Supplier<GetLogEventsRequest.Builder> builderProc = () -> GetLogEventsRequest.builder().logStreamName(FAKE_SERVICE.serviceName()).limit(qty / 2);
+        Supplier<GetLogEventsRequest.Builder> builderProc = () -> GetLogEventsRequest.builder().logStreamName(FAKE_SERVICE.serviceName()).startFromHead(false).limit(logQty);
 
-        GetLogEventsResponse response = cloudWatchClient.getLogEvents(builderProc.get().build());
-        assertThat(response.events()).isEmpty();
+        GetLogEventsResponse initialResponse = cloudWatchClient.getLogEvents(builderProc.get().build());
+        assertThat(initialResponse.events()).isEmpty();
 
-        addFakeRequestLogs(qty);
+        addFakeRequestLogs(logQty);
 
-        GetLogEventsResponse firstResponse = response;
-        response = cloudWatchClient.getLogEvents(builderProc.get().build());
+        GetLogEventsResponse firstBackwardsBatchResponse = cloudWatchClient.getLogEvents(builderProc.get().build());
 
-        assertThat(response.events()).hasSize(qty / 2);
+        assertThat(firstBackwardsBatchResponse.events()).hasSize(logQty);
+        long lastRequestNumberInFirstBatch = assertOrdering(firstBackwardsBatchResponse.events(), false);
+        String backwardToken = firstBackwardsBatchResponse.nextBackwardToken();
 
+        GetLogEventsResponse secondBackwardsBatchResponse = cloudWatchClient.getLogEvents(builderProc.get().nextToken(backwardToken).build());
+        assertThat(secondBackwardsBatchResponse.events()).hasSize(logQty);
+        long lastRequestNumberInSecondBatch = assertOrdering(secondBackwardsBatchResponse.events(), false);
+        assertThat(lastRequestNumberInSecondBatch).isLessThan(lastRequestNumberInFirstBatch);
+        // AWS considers pagination to be done when the next token equals the token provided
+        assertThat(secondBackwardsBatchResponse.nextBackwardToken()).isEqualTo(backwardToken);
+
+        GetLogEventsResponse forwardBatch = cloudWatchClient.getLogEvents(builderProc.get().startFromHead(true).nextToken(secondBackwardsBatchResponse.nextForwardToken()).build());
+        assertThat(forwardBatch.events()).hasSize(logQty);
+        assertOrdering(forwardBatch.events(), true);
+
+        /*
+        There are 2 batches in total, with 500 logs each:
+
+        0.......................499.......................999
+        <..secondBackwardsBatch..> <..firstBackwardsBatch..>
+
+        firstBackwardsBatch and forwardBatch (which we retrieve by iterating forwards from secondBackwardsBatch) should be identical
+         */
+        assertThat(forwardBatch.events().stream().map(this::parseEvent)).containsExactlyInAnyOrderElementsOf(firstBackwardsBatchResponse.events().stream().map(this::parseEvent).toList());
+    }
+
+    @Test
+    public void testPagingForwardsPagesSameSize()
+    {
+        testPaging(10, 50, true);
+    }
+
+    @Test
+    public void testPagingForwardsPagesDifferentSizes()
+    {
+        testPaging(14, 73, true);
+    }
+
+    @Test
+    public void testPagingForwardsPageLargerThanLogQty()
+    {
+        testPaging(100, 10, true);
+    }
+
+    @Test
+    public void testPagingBackwardsPagesSameSize()
+    {
+        testPaging(10, 50, false);
+    }
+
+    @Test
+    public void testPagingBackwardPagesDifferentSizes()
+    {
+        testPaging(14, 73, false);
+    }
+
+    @Test
+    public void testPagingBackwardPageLargerThanLogQty()
+    {
+        testPaging(100, 10, false);
+    }
+
+    private void testPaging(int pageSize, int logsToAdd, boolean isAscending)
+    {
+        final int allExpectedLogs = logsToAdd * 2;
+        final int expectedBatches = Math.ceilDiv(allExpectedLogs, pageSize);
+        final int lastBatchSize = allExpectedLogs % pageSize == 0 ? pageSize : allExpectedLogs % pageSize;
+
+        addFakeRequestLogs(logsToAdd);
+
+        Iterator<List<OutputLogEvent>> eventsIter = getBatchedLogs(Optional.empty(), isAscending, pageSize);
+        for (int i = 1; i <= expectedBatches; i++) {
+            assertThat(eventsIter.hasNext()).isTrue();
+            List<OutputLogEvent> nextBatch = eventsIter.next();
+            if (i < expectedBatches) {
+                assertThat(nextBatch.size()).isEqualTo(pageSize);
+            }
+            else {
+                assertThat(nextBatch.size()).isEqualTo(lastBatchSize);
+            }
+            assertOrdering(nextBatch, isAscending);
+        }
+        if (expectedBatches > 1) {
+            // We can only determine when we are on the last batch based on the next markers that we get back
+            // from our requests, so we cannot keep this assertion in cases where a single batch is expected
+            assertThat(eventsIter.hasNext()).isFalse();
+        }
+    }
+
+    private long assertOrdering(List<OutputLogEvent> events, boolean expectAscending)
+    {
+        // This method expects the start/end processing log to be included
+        // When using paging, you should use even page sizes
         Event lastChecked = null;
-        Event first = parseEvent(response.events().getFirst());
-
-        for (int i = 1; i < response.events().size(); i += 2) {
-            Event previous = parseEvent(response.events().get(i - 1));
-            Event check = parseEvent(response.events().get(i));
+        List<Event> orderedEvents = (expectAscending ? events.reversed() : events).stream().map(this::parseEvent).collect(toImmutableList());
+        for (int i = 1; i < orderedEvents.size(); i += 2) {
+            Event previous = orderedEvents.get(i - 1);
+            Event check = orderedEvents.get(i);
             assertThat(check).extracting(Event::requestNumber, Event::eventType).containsExactly(previous.requestNumber, REQUEST_START);
             assertThat(previous.eventType).isEqualTo(REQUEST_END);
             assertThat(check.requestNumber).isEqualTo(previous.requestNumber);
@@ -135,44 +225,50 @@ public class TestLogsResource
             lastChecked = check;
         }
         assertThat(lastChecked).isNotNull();
-
-        String forwardToken = response.nextForwardToken();
-
-        response = cloudWatchClient.getLogEvents(builderProc.get().nextToken(forwardToken).build());
-        assertThat(response.events()).hasSize(qty / 2);
-        assertThat(parseEvent(response.events().getLast()).requestNumber).isLessThan(lastChecked.requestNumber);
-
-        String backwardToken = firstResponse.nextBackwardToken();
-
-        response = cloudWatchClient.getLogEvents(builderProc.get().nextToken(backwardToken).build());
-        assertThat(response.events()).isNotEmpty();
-        assertThat(parseEvent(response.events().getFirst())).isEqualTo(first);
-        assertThat(response.nextBackwardToken()).isEqualTo(backwardToken);
-        assertThat(response.nextForwardToken()).isEqualTo(backwardToken.replace("b/", "f/"));
+        return lastChecked.requestNumber;
     }
 
-    @Test
-    public void testPaging()
+    private Iterator<List<OutputLogEvent>> getBatchedLogs(Optional<String> nextToken, boolean startFromHead, int limit)
     {
-        final int qty = 50;
+        return new LogsIterator(cloudWatchClient, nextToken, startFromHead, limit);
+    }
 
-        addFakeRequestLogs(qty);
+    private static class LogsIterator
+            implements Iterator<List<OutputLogEvent>>
+    {
+        private boolean hasNext = true;
+        private final CloudWatchLogsClient client;
+        private Optional<String> nextToken;
+        private final boolean startFromHead;
+        private final int limit;
 
-        GetLogEventsIterable paginator = cloudWatchClient.getLogEventsPaginator(GetLogEventsRequest.builder().logStreamName(FAKE_SERVICE.serviceName()).startFromHead(true).limit(10).build());
-        List<Event> pagedEvents = paginator.stream()
-                .flatMap(response -> response.events().stream())
-                .map(this::parseEvent)
-                .collect(toImmutableList());
+        private LogsIterator(CloudWatchLogsClient client, Optional<String> nextToken, boolean startFromHead, int limit)
+        {
+            this.client = requireNonNull(client, "client is null");
+            this.nextToken = requireNonNull(nextToken, "nextToken is null");
+            this.startFromHead = startFromHead;
+            this.limit = limit;
+        }
 
-        // start/end for each request
-        assertThat(pagedEvents).hasSize(qty * 2);
+        @Override
+        public boolean hasNext()
+        {
+            return hasNext;
+        }
 
-        for (int i = 1; i < pagedEvents.size(); i += 2) {
-            Event previous = pagedEvents.get(i - 1);
-            Event check = pagedEvents.get(i);
-            assertThat(check).extracting(Event::requestNumber, Event::eventType).containsExactly(previous.requestNumber, REQUEST_END);
-            assertThat(previous.eventType).isEqualTo(REQUEST_START);
-            assertThat(check.requestNumber).isEqualTo(previous.requestNumber);
+        @Override
+        public List<OutputLogEvent> next()
+        {
+            GetLogEventsRequest.Builder requestBuilder = GetLogEventsRequest.builder().logStreamName(FAKE_SERVICE.serviceName()).limit(limit).startFromHead(startFromHead);
+            nextToken.ifPresent(requestBuilder::nextToken);
+            GetLogEventsResponse response = client.getLogEvents(requestBuilder.build());
+            String subsequentToken = startFromHead ? response.nextForwardToken() : response.nextBackwardToken();
+            if (nextToken.isPresent()) {
+                String nextTokenValue = nextToken.get();
+                hasNext = !(nextTokenValue.equals(subsequentToken));
+            }
+            nextToken = Optional.of(subsequentToken);
+            return response.events();
         }
     }
 
